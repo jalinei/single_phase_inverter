@@ -16,7 +16,7 @@
     "homepage": "https://docs.owntech.org/",
     "frameworks": ["zephyr"],
     "platforms": ["ststm32"],
-    "headers": ["singlePhaseInverter.h", "sogi.h"],
+    "headers": ["singlePhaseInverter.h", "singlePhaseInverterFollowing.h", "singlePhaseInverterForming.h", "sogi.h"],
     "authors":
     [
         {
