@@ -72,7 +72,9 @@ public:
      * frequency within 5% of its reference, and |Vq| < 0.1 V for 1000 consecutive
      * calls before allowing a requested connection. requestSync() holds this
      * stage without requesting PWM or relay closure. A connection request first enables
-     * grid-matching PWM for at least ten grid periods with acknowledged PWM enable,
+     * PWM at 50 percent duty. After PWM enable acknowledgement, it holds neutral
+     * until the computed grid-matching duty is near 50 percent, then links that
+     * waveform and waits the configured settling periods (default ten),
      * then requests relay closure. Connection/opening feedback has a
      * one-second timeout. These are control defaults, not grid protection limits.
      *
@@ -125,7 +127,7 @@ public:
     /**
      * @brief Check whether FOLLOWING has qualified synchronization.
      * @return True after consecutive qualification in VOLTAGE_SYNC, including
-     * sync-only operation, or while aligned in PWM_SETTLE, GRID_CONNECT,
+     * sync-only operation, or while aligned in PWM_WAIT, PWM_SETTLE, GRID_CONNECT,
      * GRID_CONNECTED, or RUN.
      * False in OFF, STOPPING, DISCONNECT, FAULT, or when current alignment is lost.
      */
@@ -141,7 +143,7 @@ public:
      * @brief Supply the quality verdict of an external grid observer.
      * @param good True for acceptable grid quality; false for unacceptable quality.
      * @note In FOLLOWING, false blocks progression from synchronization to connection.
-     * In PWM_SETTLE, CONNECT, CONNECTED, RUN, STOPPING, or DISCONNECT it latches BAD_GRID_QUALITY
+     * In PWM_WAIT, PWM_SETTLE, CONNECT, CONNECTED, RUN, STOPPING, or DISCONNECT it latches BAD_GRID_QUALITY
      * and drops PWM/relay requests, without waiting for current to decrease.
      * True does not clear a latched fault.
      * Defaults to true after init() for operation without an observer; the application
@@ -193,21 +195,52 @@ public:
     /**
      * @brief Supply application-confirmed connection state.
      * @param connected True when the grid connection is established, false when open.
-     * @note Does not command hardware. Keep feedback false throughout PWM_SETTLE;
+     * @note Does not command hardware. Keep feedback false throughout PWM_WAIT and PWM_SETTLE;
      * supply closed-contact feedback only when the connection is established.
      */
     void setGridConnected(bool connected);
 
     /**
-     * @brief Acknowledge successfully applied grid-matching PWM enable from the control task.
+     * @brief Acknowledge successfully applied PWM enable from the control task.
      * @param enabled True only after duty has been applied and hardware PWM started.
-     * @note Defaults to false and is cleared on entry to PWM_SETTLE. Without this
-     * acknowledgement, the ten-period dwell cannot advance or request relay closure.
+     * @note Defaults to false and is cleared on entry to PWM_WAIT. Without this
+     * acknowledgement, the configured dwell cannot advance or request relay closure.
      * Report false whenever PWM stops; this restarts the full dwell in PWM_SETTLE.
      * Loss of acknowledgement in GRID_CONNECT faults before accepting relay feedback.
      * This confirms application action, not measured inverter terminal voltage.
      */
     void setPwmEnabled(bool enabled);
+
+    /**
+     * @brief Configure the near-neutral window for linking the computed waveform.
+     * @param tolerance Maximum absolute difference from duty 0.5, in duty units.
+     * Default 0.01 permits 0.49 through 0.51. Must be finite and in (0, 0.5).
+     * @return False for invalid values (configuration unchanged), true otherwise.
+     * @note Call from the control task. Preserved across init() and mode changes.
+     * PWM_WAIT first requests PWM at exactly 0.5; apply this duty, enable both
+     * outputs and acknowledge setPwmEnabled(true). Hold neutral until calculated
+     * duty is within this window, then follow the returned waveform each step.
+     * The relay request stays off throughout PWM_WAIT and PWM_SETTLE.
+     */
+    bool setPwmStartDutyTolerance(float32_t tolerance);
+
+    /** @brief Read the near-neutral PWM start tolerance in duty units. */
+    float32_t getPwmStartDutyTolerance() const;
+
+    /**
+     * @brief Configure acknowledged PWM settling before requesting relay closure.
+     * @param cycles Number of complete grid periods; default 10. Zero holds
+     * PWM_SETTLE indefinitely with synchronized PWM and the relay request off.
+     * @note Changing this value restarts the dwell. To release a zero-cycle hold,
+     * set a positive value; the full new dwell starts on the next control step.
+     * Repeating the same value does not restart timing. Configuration persists
+     * across init() and mode changes. Call from the control task. Changes after
+     * PWM_SETTLE apply to the next connection attempt; they do not reopen a relay.
+     */
+    void setPwmSettleCycles(uint16_t cycles);
+
+    /** @brief Read the configured settling periods; zero means indefinite hold. */
+    uint16_t getPwmSettleCycles() const;
 
     /**
      * @brief Latch FAULT immediately and drop PWM/relay requests without waiting for zero current.
@@ -234,7 +267,7 @@ public:
 
     /**
      * @brief Query the PWM enable request for the application.
-     * @return True in PWM_SETTLE and all states requesting grid connection.
+     * @return True in PWM_WAIT, PWM_SETTLE and all states requesting grid connection.
      */
     bool isPwmRequested() const;
 
@@ -317,8 +350,9 @@ private:
     bool _run_requested = false;
     bool _grid_connected = false;
     bool _pwm_enabled = false;
+    float32_t _pwm_start_duty_tolerance = 0.01F;
     double _pwm_settle_cycles = 0.0;
-    static constexpr double _pwm_settle_min_cycles = 10.0;
+    uint16_t _pwm_settle_min_cycles = 10; ///< Zero holds the relay open indefinitely.
     bool _resync_requested = false;
     float32_t _state_elapsed = 0.0F;
     const float32_t _connection_timeout = 1.0F; ///< Connection/disconnection timeout (s).

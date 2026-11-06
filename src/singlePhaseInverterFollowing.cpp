@@ -175,8 +175,9 @@ float32_t singlePhaseInverterFollowing::calculateDuty(float32_t vgrid_meas, floa
     } else {
         _current_d_pi.reset();
         _current_q_pi.reset();
-        // Match grid voltage before connection; command neutral when off.
-        _Vdq_output = (_mode == VSI_PWM_SETTLE || _mode == VSI_GRID_CONNECT) ? _Vdq : dqo_t{};
+        // Compute grid-matching duty while waiting for a near-neutral PWM start.
+        _Vdq_output = (_mode == VSI_PWM_WAIT || _mode == VSI_PWM_SETTLE ||
+                       _mode == VSI_GRID_CONNECT) ? _Vdq : dqo_t{};
     }
 
     if (_mode == VSI_FAULT) {
@@ -196,6 +197,18 @@ float32_t singlePhaseInverterFollowing::calculateDuty(float32_t vgrid_meas, floa
         !isfinite(_Vab_output.alpha) || !isfinite(_Vab_output.beta) ||
         !isfinite(_duty_cycle) || !isfinite(_power.d) || !isfinite(_power.q)) {
         tripFault(VSI_FAULT_INVALID_CONTROL_STATE);
+    }
+    if (_mode == VSI_PWM_WAIT) {
+        if (_pwm_enabled && fabsf(_duty_cycle - 0.5F) <= _pwm_start_duty_tolerance) {
+            // Link the computed waveform only near neutral, after PWM start acknowledgement.
+            enterMode(VSI_PWM_SETTLE);
+        } else {
+            // Start both outputs at neutral and hold until the waveform can be linked.
+            _Vdq_output = {};
+            _Vab_output = {};
+            _Vond = 0.0F;
+            _duty_cycle = 0.5F;
+        }
     }
     return _duty_cycle;
 
@@ -240,7 +253,7 @@ float32_t singlePhaseInverterFollowing::getw() {
 bool singlePhaseInverterFollowing::getSync() {
     return synchronizationAligned() &&
            ((_mode == VSI_VOLTAGE_SYNC && _sync_delay_counter >= _sync_min_delay) ||
-            _mode == VSI_PWM_SETTLE || _mode == VSI_GRID_CONNECT ||
+            _mode == VSI_PWM_WAIT || _mode == VSI_PWM_SETTLE || _mode == VSI_GRID_CONNECT ||
             _mode == VSI_GRID_CONNECTED || _mode == VSI_RUN);
 }
 
@@ -289,7 +302,7 @@ void singlePhaseInverterFollowing::requestSync() {
     _enabled = true;
     _connect_requested = false;
     _run_requested = false;
-    if (_mode == VSI_PWM_SETTLE || _mode == VSI_GRID_CONNECT ||
+    if (_mode == VSI_PWM_WAIT || _mode == VSI_PWM_SETTLE || _mode == VSI_GRID_CONNECT ||
         _mode == VSI_GRID_CONNECTED || _mode == VSI_RUN)
         setSyncOff();
 }
@@ -314,7 +327,30 @@ void singlePhaseInverterFollowing::setGridConnected(bool connected) {
 
 void singlePhaseInverterFollowing::setPwmEnabled(bool enabled) {
     _pwm_enabled = enabled;
-    if (!enabled) _pwm_settle_cycles = 0.0;
+    if (!enabled) {
+        _pwm_settle_cycles = 0.0;
+    }
+}
+
+bool singlePhaseInverterFollowing::setPwmStartDutyTolerance(float32_t tolerance) {
+    if (!isfinite(tolerance) || tolerance <= 0.0F || tolerance >= 0.5F) return false;
+    _pwm_start_duty_tolerance = tolerance;
+    return true;
+}
+
+float32_t singlePhaseInverterFollowing::getPwmStartDutyTolerance() const {
+    return _pwm_start_duty_tolerance;
+}
+
+void singlePhaseInverterFollowing::setPwmSettleCycles(uint16_t cycles) {
+    if (_pwm_settle_min_cycles != cycles) {
+        _pwm_settle_min_cycles = cycles;
+        _pwm_settle_cycles = 0.0;
+    }
+}
+
+uint16_t singlePhaseInverterFollowing::getPwmSettleCycles() const {
+    return _pwm_settle_min_cycles;
 }
 
 bool singlePhaseInverterFollowing::isGridConnectionRequested() const {
@@ -325,7 +361,7 @@ bool singlePhaseInverterFollowing::isGridConnectionRequested() const {
 
 bool singlePhaseInverterFollowing::isPwmRequested() const {
     if (_mode == VSI_FAULT) return false;
-    return _mode == VSI_PWM_SETTLE || isGridConnectionRequested();
+    return _mode == VSI_PWM_WAIT || _mode == VSI_PWM_SETTLE || isGridConnectionRequested();
 }
 
 vsi_fault_reason_t singlePhaseInverterFollowing::getFaultReason() const {
@@ -336,7 +372,7 @@ void singlePhaseInverterFollowing::setGridQuality(bool good) {
     _grid_quality_good = good;
     if (!good && _mode == VSI_VOLTAGE_SYNC) _sync_delay_counter = 0;
     if (!good &&
-        (_mode == VSI_PWM_SETTLE || _mode == VSI_GRID_CONNECT || _mode == VSI_GRID_CONNECTED ||
+        (_mode == VSI_PWM_WAIT || _mode == VSI_PWM_SETTLE || _mode == VSI_GRID_CONNECT || _mode == VSI_GRID_CONNECTED ||
          _mode == VSI_RUN || _mode == VSI_STOPPING || _mode == VSI_DISCONNECT)) {
         tripFault(VSI_FAULT_BAD_GRID_QUALITY);
     }
@@ -381,7 +417,7 @@ void singlePhaseInverterFollowing::enterMode(vsi_mode_t mode) {
     _state_elapsed = 0.0F;
     _sync_delay_counter = 0;
     _pwm_settle_cycles = 0.0;
-    if (mode == VSI_PWM_SETTLE) _pwm_enabled = false;
+    if (mode == VSI_PWM_WAIT) _pwm_enabled = false;
 }
 
 void singlePhaseInverterFollowing::updateMode() {
@@ -411,10 +447,18 @@ void singlePhaseInverterFollowing::updateMode() {
         if (synchronizationAligned()) {
             if (_sync_delay_counter < _sync_min_delay) ++_sync_delay_counter;
             if (_sync_delay_counter >= _sync_min_delay && _connect_requested)
-                enterMode(VSI_PWM_SETTLE);
+                enterMode(VSI_PWM_WAIT);
         } else {
             _sync_delay_counter = 0;
         }
+        break;
+    case VSI_PWM_WAIT:
+        if (!synchronizationAligned()) {
+            tripFault(VSI_FAULT_SYNC_LOST);
+        } else if (_grid_connected) {
+            tripFault(VSI_FAULT_EXTERNAL);
+        }
+        // The duty check follows voltage synthesis in calculateDuty().
         break;
     case VSI_PWM_SETTLE:
         if (!synchronizationAligned()) {
@@ -422,8 +466,8 @@ void singlePhaseInverterFollowing::updateMode() {
         } else if (_grid_connected) {
             // Contact feedback must remain open throughout the preconnection dwell.
             tripFault(VSI_FAULT_EXTERNAL);
-        } else if (_pwm_enabled) {
-            // Integrate unwrapped PLL phase: ten actual grid periods, independent of Ts.
+        } else if (_pwm_enabled && _pwm_settle_min_cycles > 0) {
+            // Integrate unwrapped PLL phase over the configured number of periods.
             _pwm_settle_cycles += static_cast<double>(_w) * _Ts / (2.0 * PI);
             if (_pwm_settle_cycles >= _pwm_settle_min_cycles)
                 enterMode(VSI_GRID_CONNECT);

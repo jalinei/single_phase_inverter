@@ -71,7 +71,8 @@ The previous `vsi_status_t` and `getStatus()` names have been replaced.
 | --- | --- |
 | `VSI_OFF` | No PWM or relay request; current PI states reset. PLL still runs. |
 | `VSI_VOLTAGE_SYNC` | Qualify grid voltage, PLL alignment, and frequency continuously. |
-| `VSI_PWM_SETTLE` | Match measured grid voltage with PWM requested and relay open for at least ten acknowledged grid periods. |
+| `VSI_PWM_WAIT` | Request PWM at exactly 50%; after enable acknowledgement, hold neutral until computed grid-matching duty is near 50%, then link the waveform. |
+| `VSI_PWM_SETTLE` | Match measured grid voltage with PWM requested and relay open for the configured acknowledged grid periods, or hold indefinitely. |
 | `VSI_GRID_CONNECT` | Keep grid-matching PWM active, request relay connection, wait for feedback. |
 | `VSI_GRID_CONNECTED` | Regulate both current axes to zero, regardless of stored current reference. |
 | `VSI_RUN` | Apply the supplied dq current reference directly, without ramping or reference clamping. |
@@ -82,7 +83,7 @@ The previous `vsi_status_t` and `getStatus()` names have been replaced.
 Call `requestSync()` to start and hold `VSI_VOLTAGE_SYNC` with PWM and relay
 requests off, even after synchronization qualifies. It cancels a pending RUN
 request and disconnects first if already connecting or connected.
-Call `requestConnect()` to allow the PWM settling stage after synchronization. After successful connection,
+Call `requestConnect()` to allow neutral PWM startup and the settling stage after synchronization. After successful connection,
 `requestRun()` requests RUN and `requestStop()` selects connected
 zero-current control. A RUN request can be supplied before connecting, but
 connection always passes through one zero-current GRID_CONNECTED control step.
@@ -96,14 +97,14 @@ counter. `getSync()` reports true once this dwell completes, even while
 `requestSync()` holds VOLTAGE_SYNC with PWM and relay requests off. A failed
 sample or bad external verdict clears qualification; a full dwell is required again.
 Changing the frequency reference in VOLTAGE_SYNC also restarts the dwell.
-In PWM_SETTLE and GRID_CONNECT, alignment is checked on every step, before accepting relay
+In PWM_WAIT, PWM_SETTLE and GRID_CONNECT, alignment is checked on every step, before accepting relay
 feedback. Loss of alignment latches `VSI_FAULT_SYNC_LOST` and drops both hardware
 requests, including when contact feedback arrives on that same step.
 These are control defaults, not a grid protection implementation.
 Loss of established connection feedback latches FAULT. Grid quality assessment
 belongs to an external observer. Feed its verdict to `setGridQuality(bool)`
 from the control task; no grid-quality observer is implemented in this class.
-A bad verdict blocks connection while synchronizing. In PWM_SETTLE, GRID_CONNECT,
+A bad verdict blocks connection while synchronizing. In PWM_WAIT, PWM_SETTLE, GRID_CONNECT,
 GRID_CONNECTED, RUN, STOPPING, or DISCONNECT, it immediately latches
 `VSI_FAULT_BAD_GRID_QUALITY` and drops PWM/relay requests without waiting for
 current to decrease. A good verdict alone does not clear FAULT or restart RUN.
@@ -120,19 +121,57 @@ can call `tripFault(reason)`; the no-argument call records `VSI_FAULT_EXTERNAL`.
 A later fault does not overwrite the first cause. `VSI_FAULT_NONE` means no
 latched fault.
 
-After qualification, PWM_SETTLE commands the measured grid voltage through
-feedforward, with current PIs reset and the relay request false. The application
-must apply the duty, start both bridge legs successfully, then call
-`setPwmEnabled(true)`. No acknowledgement means no relay closure. From that
-acknowledgement, the controller integrates PLL frequency for at least ten grid
-periods (about 200 ms at 50 Hz, 167 ms at 60 Hz). A false acknowledgement resets
-the entire dwell; entry into PWM_SETTLE also clears previous acknowledgement.
-A frequency-reference update during settling restarts the dwell. Loss of alignment
-or bad grid quality faults with both requests off. Unexpected closed-contact
-feedback during settling faults with EXTERNAL. `requestSync()` or
-`requestDisconnect()` cancels settling before relay actuation. PWM acknowledgement
-confirms software action; it does not measure inverter voltage across the relay.
-Terminal voltage/amplitude matching still needs hardware validation.
+After qualification, PWM_WAIT requests PWM at exactly 50% duty with the relay
+request off. Apply that returned duty through the paired bridge API, enable both
+outputs, then acknowledge with `setPwmEnabled(true)`. While waiting for that
+acknowledgement, the returned command remains exactly 50%.
+
+The PLL and full-amplitude grid-matching waveform continue to be computed.
+After acknowledgement, hold the applied duty at 50% until the computed duty is
+within the near-neutral window. On that control step, the returned duty switches
+to the computed waveform and the mode becomes PWM_SETTLE. Subsequent calls track
+the waveform directly; there is no voltage-amplitude ramp. The current PIs stay
+reset during PWM_WAIT, PWM_SETTLE and GRID_CONNECT.
+
+`setPwmStartDutyTolerance(tolerance)` configures this handover window in duty
+units; the default 0.01 means 49–51%. Values must be finite and strictly between
+0 and 0.5; the setter returns false without changing the configuration otherwise.
+The setting survives init() and mode changes. The application's
+`inverter_pwm_start_duty_tolerance` constant in `src/main.cpp` supplies its initial
+value. The first enable request always returns exactly 50%, independently of the
+window. Apply each returned duty in the same control step as its hardware request.
+
+The full settling dwell starts after waveform handover, with PWM acknowledged.
+The controller integrates PLL frequency for the configured number of grid periods
+(default ten: about 200 ms at 50 Hz, 167 ms at 60 Hz). A false acknowledgement
+resets the dwell; entry into PWM_WAIT clears previous acknowledgement. A frequency
+reference update during settling also restarts the dwell. Loss of alignment or
+bad grid quality faults with both requests off. Unexpected closed-contact feedback
+in PWM_WAIT or PWM_SETTLE faults with EXTERNAL. `requestSync()` or
+`requestDisconnect()` cancels either stage before relay actuation. PWM
+acknowledgement confirms software action; it does not measure inverter voltage
+across the relay. Terminal voltage/amplitude matching still needs hardware validation.
+
+Configure this from the control task using `setPwmSettleCycles(uint16_t)` and read
+it with `getPwmSettleCycles()`. Zero holds PWM_SETTLE indefinitely: synchronized
+PWM stays requested and relay closure stays inhibited. The normal PWM
+acknowledgement, synchronization, quality and contact-feedback checks still apply.
+To release the hold, set a positive count; the controller waits the full new dwell
+before requesting closure. Changing the count also restarts an in-progress dwell;
+repeating the same setting preserves progress. The configuration survives `init()`
+and mode changes. Changing it after PWM_SETTLE affects the next connection attempt.
+
+```cpp
+inverter.setPwmSettleCycles(0);  // Hold synchronized PWM with the relay open.
+inverter.requestConnect();     // Qualify sync, enable neutral PWM, then link waveform.
+// The hardware loop applies duty, starts PWM, and acknowledges setPwmEnabled(true).
+// Later, from the control task:
+inverter.setPwmSettleCycles(20); // Allow closure after 20 more complete periods.
+```
+
+The application's `inverter_pwm_settle_cycles` constant in `src/main.cpp` supplies
+the startup configuration; it defaults to 10. The current application's sync-only
+operation does not enter PWM_SETTLE.
 
 Connection feedback must arrive within one second of GRID_CONNECT. Loss of PWM
 acknowledgement in GRID_CONNECT faults with PWM_UPDATE_FAILED before accepting
@@ -153,7 +192,7 @@ hardware actions.
   is true exactly in GRID_CONNECT, GRID_CONNECTED, RUN, and STOPPING.
 - `isPwmRequested()` supplies the PWM enable command. The application applies
   the duty through its paired hardware API and stops PWM when this is false.
-  In FOLLOWING, it is true in PWM_SETTLE plus the four relay-request states;
+  In FOLLOWING, it is true in PWM_WAIT and PWM_SETTLE plus the four relay-request states;
   DISCONNECT always requests both outputs off. After applying the duty and starting
   PWM successfully, acknowledge with `setPwmEnabled(true)` from the control task.
   Report `setPwmEnabled(false)` whenever PWM stops; report failed duty/start actions
@@ -179,8 +218,8 @@ Run `bash tests/inverter/run.sh` from the project root. Host tests use the real
 SOGI, PLL, transforms, and PI implementation with CMSIS math/logging shims.
 They cover both controller types, following sequencing, direct references, and
 fault handling, invalid setup/references, arithmetic overflow, sync-only
-qualification, ten-period acknowledged PWM settling at 50/60 Hz and two sample
-rates, interrupted/cancelled settling, and alignment loss before relay closure. Tests enable undefined
+qualification, neutral PWM start and near-neutral waveform handover, ten-period acknowledged PWM settling at 50/60 Hz and two sample
+rates, configurable dwell counts, indefinite hold/release, interrupted/cancelled settling, and alignment loss before relay closure. Tests enable undefined
 behavior and float-to-integer overflow sanitizers. Power-stage behavior and relay timing require hardware validation.
 
 ## Dependencies
@@ -215,7 +254,7 @@ The runtime example uses FOLLOWING; FORMING tuning is listed for completeness.
 | Modulation | Controller duty is `0.5 + Valpha/(2*Vbus)` without clamping; example initializes paired unipolar PWM. | Validate factor of two, bridge polarity, actual output amplitude, paired updates, carrier alignment, duty limits and anti-windup when modulation saturates. |
 | PLL/SOGI | SOGI gain 500; PLL tuned for nominal one-period rise time and damping 0.7; correction bounds ±10 nominal angular frequency. | Check gain units, phase/amplitude errors, acquisition, harmonics, DC offset, delay and frequency excursions. PLL bounds can permit unrealistic estimates before alignment is checked. |
 | Initial synchronization | Positive Vd within ±10% nominal peak, abs(Vq)<0.1 V, frequency within ±5%; 1000 consecutive calls. | Confirm tolerances against sensor noise and distortion. At 325 V peak, 0.1 V q corresponds to about 0.018° under the small-angle assumption. Dwell is sample-count based: 100 ms only at 10 kHz. |
-| PWM before closure | Now at least ten measured periods in PWM_SETTLE, with application PWM acknowledgement and relay request off. | Validate actual terminal voltage across open contacts and filter settling. Matching measured grid feedforward does not itself prove inverter-side voltage matching. Confirm required duration on hardware. |
+| PWM before closure | PWM starts at 50%, then links the computed waveform near neutral (default ±0.01 duty). Configurable measured periods in PWM_SETTLE (default ten, zero holds indefinitely), with application PWM acknowledgement and relay request off. | Validate actual terminal voltage across open contacts and filter settling. Matching measured grid feedforward does not itself prove inverter-side voltage matching. Confirm required duration on hardware. |
 | Relay integration | GRID_CONNECT waits up to 1 s for independent contact feedback. main.cpp has no relay output/feedback path and never requests connection. | Confirm pin mapping, contact delay/bounce, welded-contact detection, zero-crossing strategy and startup feedback plausibility. Never substitute the relay request for physical feedback. |
 | Stop/disconnect | Both dq currents below 0.1 A allow PWM off and relay opening; combined timeout 1 s. Faults drop requests immediately. | Confirm thresholds, decay, filter energy/freewheel paths and relay opening behavior under normal and emergency shutdown. |
 | Grid observer | 207–253 V RMS, 47.5–52.5 Hz, 100 ms violation delays, 1 s healthy qualification; VAC stale after 20 ms. | Confirm installation protection requirements and total filter/PLL latency. This observer is not complete islanding detection. Connected/RUN states rely on this verdict rather than continuously faulting on the strict connection-alignment test. |
