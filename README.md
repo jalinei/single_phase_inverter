@@ -71,7 +71,8 @@ The previous `vsi_status_t` and `getStatus()` names have been replaced.
 | --- | --- |
 | `VSI_OFF` | No PWM or relay request; current PI states reset. PLL still runs. |
 | `VSI_VOLTAGE_SYNC` | Qualify grid voltage, PLL alignment, and frequency continuously. |
-| `VSI_GRID_CONNECT` | Match measured grid voltage, request PWM/relay connection, wait for feedback. |
+| `VSI_PWM_SETTLE` | Match measured grid voltage with PWM requested and relay open for at least ten acknowledged grid periods. |
+| `VSI_GRID_CONNECT` | Keep grid-matching PWM active, request relay connection, wait for feedback. |
 | `VSI_GRID_CONNECTED` | Regulate both current axes to zero, regardless of stored current reference. |
 | `VSI_RUN` | Apply the supplied dq current reference directly, without ramping or reference clamping. |
 | `VSI_STOPPING` | Keep PWM and relay enabled; regulate both current axes to zero. |
@@ -81,7 +82,7 @@ The previous `vsi_status_t` and `getStatus()` names have been replaced.
 Call `requestSync()` to start and hold `VSI_VOLTAGE_SYNC` with PWM and relay
 requests off, even after synchronization qualifies. It cancels a pending RUN
 request and disconnects first if already connecting or connected.
-Call `requestConnect()` to allow connection after synchronization. After successful connection,
+Call `requestConnect()` to allow the PWM settling stage after synchronization. After successful connection,
 `requestRun()` requests RUN and `requestStop()` selects connected
 zero-current control. A RUN request can be supplied before connecting, but
 connection always passes through one zero-current GRID_CONNECTED control step.
@@ -95,14 +96,14 @@ counter. `getSync()` reports true once this dwell completes, even while
 `requestSync()` holds VOLTAGE_SYNC with PWM and relay requests off. A failed
 sample or bad external verdict clears qualification; a full dwell is required again.
 Changing the frequency reference in VOLTAGE_SYNC also restarts the dwell.
-In GRID_CONNECT, alignment is checked on every step, before accepting relay
+In PWM_SETTLE and GRID_CONNECT, alignment is checked on every step, before accepting relay
 feedback. Loss of alignment latches `VSI_FAULT_SYNC_LOST` and drops both hardware
 requests, including when contact feedback arrives on that same step.
 These are control defaults, not a grid protection implementation.
 Loss of established connection feedback latches FAULT. Grid quality assessment
 belongs to an external observer. Feed its verdict to `setGridQuality(bool)`
 from the control task; no grid-quality observer is implemented in this class.
-A bad verdict blocks connection while synchronizing. In GRID_CONNECT,
+A bad verdict blocks connection while synchronizing. In PWM_SETTLE, GRID_CONNECT,
 GRID_CONNECTED, RUN, STOPPING, or DISCONNECT, it immediately latches
 `VSI_FAULT_BAD_GRID_QUALITY` and drops PWM/relay requests without waiting for
 current to decrease. A good verdict alone does not clear FAULT or restart RUN.
@@ -119,7 +120,23 @@ can call `tripFault(reason)`; the no-argument call records `VSI_FAULT_EXTERNAL`.
 A later fault does not overwrite the first cause. `VSI_FAULT_NONE` means no
 latched fault.
 
-Connection feedback must arrive within one second of GRID_CONNECT. During
+After qualification, PWM_SETTLE commands the measured grid voltage through
+feedforward, with current PIs reset and the relay request false. The application
+must apply the duty, start both bridge legs successfully, then call
+`setPwmEnabled(true)`. No acknowledgement means no relay closure. From that
+acknowledgement, the controller integrates PLL frequency for at least ten grid
+periods (about 200 ms at 50 Hz, 167 ms at 60 Hz). A false acknowledgement resets
+the entire dwell; entry into PWM_SETTLE also clears previous acknowledgement.
+A frequency-reference update during settling restarts the dwell. Loss of alignment
+or bad grid quality faults with both requests off. Unexpected closed-contact
+feedback during settling faults with EXTERNAL. `requestSync()` or
+`requestDisconnect()` cancels settling before relay actuation. PWM acknowledgement
+confirms software action; it does not measure inverter voltage across the relay.
+Terminal voltage/amplitude matching still needs hardware validation.
+
+Connection feedback must arrive within one second of GRID_CONNECT. Loss of PWM
+acknowledgement in GRID_CONNECT faults with PWM_UPDATE_FAILED before accepting
+contact feedback. During
 STOPPING, PWM and relay remain enabled while both current axes target zero.
 Once both measured dq axes are below 0.1 A, the mode becomes DISCONNECT:
 PWM and relay requests are false while awaiting open contact feedback. Current
@@ -136,8 +153,11 @@ hardware actions.
   is true exactly in GRID_CONNECT, GRID_CONNECTED, RUN, and STOPPING.
 - `isPwmRequested()` supplies the PWM enable command. The application applies
   the duty through its paired hardware API and stops PWM when this is false.
-  In FOLLOWING, it is derived from the same four states as the relay request;
-  DISCONNECT always requests both outputs off.
+  In FOLLOWING, it is true in PWM_SETTLE plus the four relay-request states;
+  DISCONNECT always requests both outputs off. After applying the duty and starting
+  PWM successfully, acknowledge with `setPwmEnabled(true)` from the control task.
+  Report `setPwmEnabled(false)` whenever PWM stops; report failed duty/start actions
+  with `tripFault(VSI_FAULT_PWM_UPDATE_FAILED)`.
 - `setGridConnected(bool)` supplies confirmed relay contact feedback, independently
   of the requested state. Do not echo the request as physical feedback.
 - `clearFault()` succeeds only with open connection feedback and, in FOLLOWING,
@@ -159,10 +179,49 @@ Run `bash tests/inverter/run.sh` from the project root. Host tests use the real
 SOGI, PLL, transforms, and PI implementation with CMSIS math/logging shims.
 They cover both controller types, following sequencing, direct references, and
 fault handling, invalid setup/references, arithmetic overflow, sync-only
-qualification, and alignment loss before relay closure. Tests enable undefined
+qualification, ten-period acknowledged PWM settling at 50/60 Hz and two sample
+rates, interrupted/cancelled settling, and alignment loss before relay closure. Tests enable undefined
 behavior and float-to-integer overflow sanitizers. Power-stage behavior and relay timing require hardware validation.
 
 ## Dependencies
 
 Requires `transform`, `pid`, `trigo`, and math/type headers from the OwnTech
 control library configured in `platformio.ini`.
+
+## Assumptions to confirm for the 450 W design
+
+These are settings and gaps found in the source, not approved hardware ratings.
+The runtime example uses FOLLOWING; FORMING tuning is listed for completeness.
+
+| Item | Current assumption | Evidence or decision needed |
+| --- | --- | --- |
+| Power rating | 450 W is the intended rating supplied by the user; controllers have no explicit power limit. | Define whether this is PV input, DC output, or continuous AC output, and the voltage/temperature range. Obtain the schematic, component ratings, efficiency and thermal limits. |
+| Boost total input current | Voltage PID output is 0–2 A in main.cpp, shared by BUSREG and MPPT. | No rating-derived justification is documented. Use input voltage and efficiency: for 450 W downstream, input current is `450 / (efficiency * VLow)`. At 40 V this is 11.25 A ideally or 12.5 A at assumed 90% efficiency. Do not replace 2 A using bus current. |
+| Leg allocation | Leg 1 gets up to 1 A; leg 2 receives all excess. STARTUP only uses leg 1. | Confirm sequential allocation versus balanced/interleaved operation. Leg 2 has no independent current-reference ceiling; raising total current alone would send almost all extra current to leg 2. |
+| Startup current | 1 A input-current reference maximum, not a measured overcurrent trip. | Confirm capacitor charging, input-source capability, inductor saturation and switch peak current including ripple. |
+| Startup ramp | 10 V/s, 0.01 V per 1 ms cold call, seeded from measured bus voltage. | Confirm capacitance and allowed inrush: capacitor power is `Cbus * Vbus * dVbus/dt`; add loads and losses to derive input current. A 40→400 V reference takes 36 s without pauses. Actual bus rise can lag the reference. |
+| Uncontrolled precharge | A boost normally has a passive input-to-bus path depending on its topology. | Check actual diode/body-diode paths and precharge hardware. A software voltage ramp cannot limit current through an uncontrolled path. |
+| BUSREG transitions | BUSREG uses the bus target immediately; selecting a mode resets PI states and demand. No input-current slew limiter. | Decide whether direct BUSREG entry is allowed and specify current/power slew and bumpless transitions. Lowering the bus target cannot actively discharge a unidirectional boost. |
+| Bus target/headroom | 400 V target, 395 V burst resume, 405 V pause; target can be changed from 1 to 404 V by serial commands. | Confirm bus capacitor/switch ratings, grid peak plus filter voltage and modulation margin, and undervoltage/overvoltage trips. The command lower bound does not guarantee a usable inverter bus. |
+| Burst operation | STARTUP/BUSREG pause both legs at 405 V and reset all PIs; resume at 395 V. MPPT bypasses burst protection. | Confirm acceptable ripple, restart transients, sensing delay and 100 Hz single-phase bus ripple. Burst cutoff is not an independent overvoltage protection mechanism. |
+| Boost voltage PI | Ts=1 ms, Kp=0.05, Ti=0.1 s; no derivative. | Validate loop bandwidth and stability with actual capacitance, source impedance and load. Check interaction with 100 Hz ripple and inverter power regulation. |
+| Boost current PI | Ts=100 us, Kp=0.000215, Ti=75.175 us; same gains for both legs. | Validate inductance, parasitics, sensor scaling, PWM frequency and sample/update delay across the operating range. |
+| Boost duty | Current PID output is 5–95%; hardware minimum duty is also 5%. Zero reference disables the leg through enable flags. | Confirm off behavior and required conversion ratio. Ideal boost duty is `1 - VLow/Vbus`; 40→400 V requires about 90%, before losses. Verify available off-time and saturation handling. |
+| MPPT speed | Fixed 0.1 A perturbation each 1 ms cold-loop call: up to 100 A/s nominal reference slew. Uses instantaneous VLow × summed current. | Confirm PV dynamics and settling before each comparison; decide averaging/filtering, independent MPPT cadence, perturbation size and response to irradiance changes. |
+| MPPT power balance | Boost MPPT does not regulate bus voltage. The example has no inverter bus-voltage controller and keeps inverter PWM off. | Define DC-bus regulation and power handoff before MPPT operation with injection. Prevent uncontrolled bus charging when no output stage consumes power. |
+| Grid nominal values | 230 V RMS (325.27 V peak), 50 Hz; inverter measurements and dq references use instantaneous/peak conventions. | Confirm sensor units, polarity, phase order and P/Q sign. At unity power factor, 450 W / 230 V = 1.96 A RMS, 2.77 A peak; this is separate from boost input current. |
+| Inverter current PI | FOLLOWING Kp=0.001, Ti=0.0003 s; each output correction limited to ±30 V, added to grid-voltage feedforward. | Tune for the actual L/LCL filter, resistance, delay and damping. ±30 V is a voltage correction limit, not a 30 A current limit. Verify cross-axis coupling and saturation behavior. |
+| Inverter RUN reference | d/q current references are applied directly, without clamp, ramp, or power limit. | Define peak/RMS convention, active/reactive priority, total current-vector limit and current/power slew. Verify measured overcurrent protection separately. |
+| Modulation | Controller duty is `0.5 + Valpha/(2*Vbus)` without clamping; example initializes paired unipolar PWM. | Validate factor of two, bridge polarity, actual output amplitude, paired updates, carrier alignment, duty limits and anti-windup when modulation saturates. |
+| PLL/SOGI | SOGI gain 500; PLL tuned for nominal one-period rise time and damping 0.7; correction bounds ±10 nominal angular frequency. | Check gain units, phase/amplitude errors, acquisition, harmonics, DC offset, delay and frequency excursions. PLL bounds can permit unrealistic estimates before alignment is checked. |
+| Initial synchronization | Positive Vd within ±10% nominal peak, abs(Vq)<0.1 V, frequency within ±5%; 1000 consecutive calls. | Confirm tolerances against sensor noise and distortion. At 325 V peak, 0.1 V q corresponds to about 0.018° under the small-angle assumption. Dwell is sample-count based: 100 ms only at 10 kHz. |
+| PWM before closure | Now at least ten measured periods in PWM_SETTLE, with application PWM acknowledgement and relay request off. | Validate actual terminal voltage across open contacts and filter settling. Matching measured grid feedforward does not itself prove inverter-side voltage matching. Confirm required duration on hardware. |
+| Relay integration | GRID_CONNECT waits up to 1 s for independent contact feedback. main.cpp has no relay output/feedback path and never requests connection. | Confirm pin mapping, contact delay/bounce, welded-contact detection, zero-crossing strategy and startup feedback plausibility. Never substitute the relay request for physical feedback. |
+| Stop/disconnect | Both dq currents below 0.1 A allow PWM off and relay opening; combined timeout 1 s. Faults drop requests immediately. | Confirm thresholds, decay, filter energy/freewheel paths and relay opening behavior under normal and emergency shutdown. |
+| Grid observer | 207–253 V RMS, 47.5–52.5 Hz, 100 ms violation delays, 1 s healthy qualification; VAC stale after 20 ms. | Confirm installation protection requirements and total filter/PLL latency. This observer is not complete islanding detection. Connected/RUN states rely on this verdict rather than continuously faulting on the strict connection-alignment test. |
+| Measurements | Cached samples; freshness tracked only for VAC. Boost setters ignore nonfinite values. Invalid/nonpositive live bus samples do not replace the inverter's previous positive bus value in main.cpp. | Validate calibration, offset, bandwidth and synchronized ADC/PWM sampling. Define stale/invalid handling for all currents and voltages, bus plausibility and independent trip paths. |
+| Timing and concurrency | Control task 100 us, boost cold loop every ten ticks. Background task changes shared mode, voltage target and deadtime. | Measure worst-case execution time, jitter and actual sample cadence; check safe transfer of requests and coherent telemetry. Grid-period dwell assumes calculateDuty is called once per configured Ts. |
+| Hardware configuration | platformio.ini lists twist 1.4.2; src/app.ini selects uSolarVerter 0.9.0; current CMake selects uSolarVerter. | Verify resolved build configuration and actual board/shield/sensor/PWM mappings, switching frequencies, interleaving and inverter deadtime. |
+| Deadtime controls | Boost setup uses the leg-2 variable for both legs (currently both 100 ns). Serial decrement can go below the declared 40 ns minimum; no explicit maximum. | Confirm gate-driver requirements and bounds. Correct these controls before using them to characterize hardware. |
+| Hardware protections | Neither controller's current-reference limit is a hardware trip. No system-level thermal, PV undervoltage, bus-energy or independent peak-current protection is established by these classes. | Identify implemented hardware shutdown paths and define software limits, response times and fault-reset interlocks using the actual design. |
+| FORMING, if used | Current Kp=0.001, Ti=0.001/3000 s (~0.333 us), ±30 V; voltage Kp=0.01, Ti=3 ms, ±30 A correction added to external reference. Positive Vd reference enables PWM. | Confirm the unusually short current integral time, loop separation, current limit after summation, voltage ramp and restart behavior. FORMING has no grid-following relay sequence. |

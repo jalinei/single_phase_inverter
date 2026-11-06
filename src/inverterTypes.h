@@ -30,7 +30,8 @@ typedef enum {
     VSI_RUN,            ///< Apply the supplied dq current reference directly.
     VSI_STOPPING,       ///< Keep PWM/relay enabled while regulating current to zero.
     VSI_DISCONNECT,     ///< PWM off; request relay opening and wait for open feedback.
-    VSI_FAULT          ///< Latched shutdown; requires explicit clearFault().
+    VSI_FAULT,         ///< Latched shutdown; requires explicit clearFault().
+    VSI_PWM_SETTLE     ///< Match grid with PWM on for ten periods; relay remains open.
 } vsi_mode_t;
 
 /** @brief First cause of a latched VSI_FAULT; cleared by clearFault() or init(). */
@@ -47,5 +48,5 @@ typedef enum {
     VSI_FAULT_EXTERNAL,             ///< Application-reported fault without a specific cause.
     VSI_FAULT_INVALID_CONFIGURATION, ///< Invalid initialization or failed PI setup.
     VSI_FAULT_INVALID_REFERENCE,     ///< Nonfinite dq reference or invalid frequency reference.
-    VSI_FAULT_SYNC_LOST              ///< PLL alignment lost while awaiting relay closure.
+    VSI_FAULT_SYNC_LOST              ///< PLL alignment lost during PWM settling or while awaiting relay closure.
 } vsi_fault_reason_t;

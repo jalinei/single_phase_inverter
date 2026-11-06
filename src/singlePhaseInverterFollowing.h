@@ -71,7 +71,9 @@ public:
      * FOLLOWING qualifies positive d voltage within 10% of the nominal peak,
      * frequency within 5% of its reference, and |Vq| < 0.1 V for 1000 consecutive
      * calls before allowing a requested connection. requestSync() holds this
-     * stage without requesting PWM or relay closure. Connection/opening feedback has a
+     * stage without requesting PWM or relay closure. A connection request first enables
+     * grid-matching PWM for at least ten grid periods with acknowledged PWM enable,
+     * then requests relay closure. Connection/opening feedback has a
      * one-second timeout. These are control defaults, not grid protection limits.
      *
      * @param vgrid_meas Instantaneous measured grid voltage in volts.
@@ -123,7 +125,8 @@ public:
     /**
      * @brief Check whether FOLLOWING has qualified synchronization.
      * @return True after consecutive qualification in VOLTAGE_SYNC, including
-     * sync-only operation, or while aligned in GRID_CONNECT, GRID_CONNECTED, or RUN.
+     * sync-only operation, or while aligned in PWM_SETTLE, GRID_CONNECT,
+     * GRID_CONNECTED, or RUN.
      * False in OFF, STOPPING, DISCONNECT, FAULT, or when current alignment is lost.
      */
     bool getSync();
@@ -138,7 +141,7 @@ public:
      * @brief Supply the quality verdict of an external grid observer.
      * @param good True for acceptable grid quality; false for unacceptable quality.
      * @note In FOLLOWING, false blocks progression from synchronization to connection.
-     * In CONNECT, CONNECTED, RUN, STOPPING, or DISCONNECT it latches BAD_GRID_QUALITY
+     * In PWM_SETTLE, CONNECT, CONNECTED, RUN, STOPPING, or DISCONNECT it latches BAD_GRID_QUALITY
      * and drops PWM/relay requests, without waiting for current to decrease.
      * True does not clear a latched fault.
      * Defaults to true after init() for operation without an observer; the application
@@ -190,10 +193,21 @@ public:
     /**
      * @brief Supply application-confirmed connection state.
      * @param connected True when the grid connection is established, false when open.
-     * @note Does not command hardware. With no relay, the application may use PWM
-     * enable/disable acknowledgement as its logical connection feedback.
+     * @note Does not command hardware. Keep feedback false throughout PWM_SETTLE;
+     * supply closed-contact feedback only when the connection is established.
      */
     void setGridConnected(bool connected);
+
+    /**
+     * @brief Acknowledge successfully applied grid-matching PWM enable from the control task.
+     * @param enabled True only after duty has been applied and hardware PWM started.
+     * @note Defaults to false and is cleared on entry to PWM_SETTLE. Without this
+     * acknowledgement, the ten-period dwell cannot advance or request relay closure.
+     * Report false whenever PWM stops; this restarts the full dwell in PWM_SETTLE.
+     * Loss of acknowledgement in GRID_CONNECT faults before accepting relay feedback.
+     * This confirms application action, not measured inverter terminal voltage.
+     */
+    void setPwmEnabled(bool enabled);
 
     /**
      * @brief Latch FAULT immediately and drop PWM/relay requests without waiting for zero current.
@@ -220,7 +234,7 @@ public:
 
     /**
      * @brief Query the PWM enable request for the application.
-     * @return The grid connection request.
+     * @return True in PWM_SETTLE and all states requesting grid connection.
      */
     bool isPwmRequested() const;
 
@@ -302,6 +316,9 @@ private:
     bool _connect_requested = false;
     bool _run_requested = false;
     bool _grid_connected = false;
+    bool _pwm_enabled = false;
+    double _pwm_settle_cycles = 0.0;
+    static constexpr double _pwm_settle_min_cycles = 10.0;
     bool _resync_requested = false;
     float32_t _state_elapsed = 0.0F;
     const float32_t _connection_timeout = 1.0F; ///< Connection/disconnection timeout (s).
